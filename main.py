@@ -142,9 +142,6 @@ def moon_illumination(dt: datetime) -> float:
 
 
 def fetch_weather(lat: float, lon: float, target_dt: datetime) -> tuple[float, float]:
-    """
-    Open-Meteoから雲量(%)と視程(km)を取得して、指定時刻に最も近い値を返す。
-    """
     url = (
         "https://api.open-meteo.com/v1/forecast"
         f"?latitude={lat}&longitude={lon}"
@@ -322,7 +319,7 @@ def auto_fetch() -> None:
     st.success(
         f"自動取得完了: 雲量 {cloud:.1f}%, 視程 {visibility:.1f} km, 月明かり推定 {moon_pct}%"
     )
-    run_prediction_and_show()
+    st.experimental_rerun()
 
 
 def show_best_conditions() -> None:
@@ -360,13 +357,15 @@ def main() -> None:
     init_state()
     st.title("レッドスプライト観測予測 (Web版)")
 
+    # アクションを先に処理することで、状態更新後に入力ウィジェットが再描画される
+    render_actions()
+
     col_map, col_form = st.columns([1, 1])
     with col_map:
         render_map()
     with col_form:
         render_inputs()
 
-    render_actions()
     show_formula()
 
 
