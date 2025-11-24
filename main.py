@@ -197,6 +197,32 @@ def init_state() -> None:
         st.session_state.setdefault(k, v)
 
 
+def state_float(key: str, default: float, min_v: float | None = None, max_v: float | None = None) -> float:
+    try:
+        val = float(st.session_state.get(key, default))
+    except Exception:  # noqa: BLE001
+        val = default
+    if min_v is not None:
+        val = max(min_v, val)
+    if max_v is not None:
+        val = min(max_v, val)
+    st.session_state[key] = val
+    return val
+
+
+def state_int(key: str, default: int, min_v: int | None = None, max_v: int | None = None) -> int:
+    try:
+        val = int(st.session_state.get(key, default))
+    except Exception:  # noqa: BLE001
+        val = default
+    if min_v is not None:
+        val = max(min_v, val)
+    if max_v is not None:
+        val = min(max_v, val)
+    st.session_state[key] = val
+    return val
+
+
 def build_map(lat: float, lon: float) -> dict[str, Any] | None:
     m = folium.Map(location=[lat, lon], zoom_start=5, control_scale=True)
     folium.Marker([lat, lon], tooltip=f"{lat:.3f}, {lon:.3f}").add_to(m)
@@ -205,13 +231,23 @@ def build_map(lat: float, lon: float) -> dict[str, Any] | None:
 
 def render_inputs() -> None:
     st.subheader("観測条件の入力")
+    # セッション値を安全に数値へ正規化
+    lat_val = state_float("lat", 35.0, -90.0, 90.0)
+    lon_val = state_float("lon", 138.0, -180.0, 180.0)
+    month_val = state_int("month", datetime.now().month, 1, 12)
+    hour_val = state_int("hour", datetime.now().hour, 0, 23)
+    storm_val = state_float("storm", 6.0, 0.0, 10.0)
+    cloud_val = state_float("cloud", 30.0, 0.0, 100.0)
+    moon_val = state_float("moon", 40.0, 0.0, 100.0)
+    vis_val = state_float("vis", 20.0, 0.0, 40.0)
+
     col1, col2 = st.columns([1, 1])
     with col1:
-        st.number_input("緯度 (-90〜90)", value=st.session_state["lat"], key="lat", step=0.1)
-        st.number_input("経度 (-180〜180)", value=st.session_state["lon"], key="lon", step=0.1)
-        st.number_input("月 (1-12)", min_value=1, max_value=12, value=st.session_state["month"], key="month")
-        st.number_input("時刻 (0-23)", min_value=0, max_value=23, value=st.session_state["hour"], key="hour")
-        st.slider("雷活動（0:静穏〜10:非常に活発）", 0.0, 10.0, value=st.session_state["storm"], step=0.5, key="storm")
+        st.number_input("緯度 (-90〜90)", value=lat_val, key="lat", step=0.1)
+        st.number_input("経度 (-180〜180)", value=lon_val, key="lon", step=0.1)
+        st.number_input("月 (1-12)", min_value=1, max_value=12, value=month_val, key="month")
+        st.number_input("時刻 (0-23)", min_value=0, max_value=23, value=hour_val, key="hour")
+        st.slider("雷活動（0:静穏〜10:非常に活発）", 0.0, 10.0, value=storm_val, step=0.5, key="storm")
         with st.expander("雷活動の目安"):
             st.write(
                 "- 雷ナウキャスト: 色付き発雷域が連続=6〜8, 広域で強=9〜10, 点在=3〜5, 無=0\n"
@@ -221,7 +257,7 @@ def render_inputs() -> None:
                 "- 体感: 遠雷たまに=3〜4, 10分に数回=5〜6, ほぼ鳴り続く=8〜10"
             )
     with col2:
-        st.slider("雲量％", 0.0, 100.0, value=st.session_state["cloud"], step=5.0, key="cloud")
+        st.slider("雲量％", 0.0, 100.0, value=cloud_val, step=5.0, key="cloud")
         with st.expander("雲量の目安"):
             st.write(
                 "- 衛星画像: 厚い雲=80〜100, 積雲帯/まとまり=40〜70, ほぼ雲なし=0〜20\n"
@@ -229,7 +265,7 @@ def render_inputs() -> None:
                 "- 目視: 空の雲が7〜10割=70〜100, 4〜6割=40〜60, 1〜3割=10〜30, 快晴=0〜5\n"
                 "- 星の見え方: うっすら見える=20〜40, ほぼ見えない=60〜90"
             )
-        st.slider("月明かりの明るさ％", 0.0, 100.0, value=st.session_state["moon"], step=5.0, key="moon")
+        st.slider("月明かりの明るさ％", 0.0, 100.0, value=moon_val, step=5.0, key="moon")
         with st.expander("月明かりの目安"):
             st.write(
                 "- 月齢: 新月〜三日月=0〜20, 上弦/下弦=40〜60, 十三夜〜満月=80〜100\n"
@@ -237,7 +273,7 @@ def render_inputs() -> None:
                 "- 雲越し: 朧月=20〜40, 厚めの雲でボヤける=40〜70, くっきり=70〜100\n"
                 "- 体感: 見えない=0〜10, ぼんやり=30〜50, 眩しく影=70〜100"
             )
-        st.slider("視程 (km) 0-40", 0.0, 40.0, value=st.session_state["vis"], step=1.0, key="vis")
+        st.slider("視程 (km) 0-40", 0.0, 40.0, value=vis_val, step=1.0, key="vis")
         with st.expander("視程の目安"):
             st.write(
                 "- METAR VIS: 10km+ →10〜15km、9999なら15km以上\n"
