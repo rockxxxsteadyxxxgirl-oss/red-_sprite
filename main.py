@@ -319,7 +319,11 @@ def auto_fetch() -> None:
     st.success(
         f"自動取得完了: 雲量 {cloud:.1f}%, 視程 {visibility:.1f} km, 月明かり推定 {moon_pct}%"
     )
-    st.experimental_rerun()
+    # Streamlitのバージョンに応じて再実行APIが異なる
+    if hasattr(st, "rerun"):
+        st.rerun()
+    else:
+        st.experimental_rerun()
 
 
 def show_best_conditions() -> None:
