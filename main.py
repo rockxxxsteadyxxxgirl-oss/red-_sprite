@@ -1,11 +1,15 @@
 import json
 import math
-import tkinter as tk
 from datetime import datetime
-from tkinter import messagebox, ttk
+from typing import Any
 from urllib import error, request
 
-import tkintermapview as tkmv
+import folium
+import streamlit as st
+from streamlit_folium import st_folium
+
+
+st.set_page_config(page_title="レッドスプライト観測予測(Web)", layout="wide")
 
 
 def clamp(value: float, min_value: float = 0.0, max_value: float = 1.0) -> float:
@@ -17,9 +21,6 @@ def clamp(value: float, min_value: float = 0.0, max_value: float = 1.0) -> float
 
 
 def trapezoid_score(value: float, low: float, opt_low: float, opt_high: float, high: float) -> float:
-    """
-    線形台形で0-1スコアを返す。low〜opt_lowで線形増、opt_high〜highで線形減、最適区間は1。
-    """
     if value <= low or value >= high:
         return 0.0
     if opt_low <= value <= opt_high:
@@ -39,10 +40,6 @@ def predict_red_sprite_probability(
     moon_brightness: float,
     visibility_km: float,
 ) -> tuple[float, list[str], str]:
-    """
-    ロジスティック結合を使った簡易ヒューリスティック推定。
-    0-1の確率、理由リスト、日本語ヒントを返す。
-    """
     reasons: list[str] = []
 
     lat_score = trapezoid_score(latitude, low=-10.0, opt_low=10.0, opt_high=45.0, high=60.0)
@@ -118,9 +115,9 @@ def predict_red_sprite_probability(
         reasons.append("視程が短く減光が大きい。")
 
     if probability > 0.7:
-        hint = "観測条件は良好です。カメラと双眼鏡を準備し、雷雲の真上より少し離れた方向を注視。"
+        hint = "観測条件は良好。雷雲の真上より少し離れた方向を注視し、カメラと双眼鏡を準備。"
     elif probability > 0.4:
-        hint = "条件は並程度。落雷数が増えれば狙い目です。カメラは長秒露光を準備。"
+        hint = "条件は並程度。落雷数が増えれば狙い目。カメラは長秒露光を準備。"
     else:
         hint = "条件は弱め。雷活動が活発化するタイミングまで待機がおすすめ。"
 
@@ -128,9 +125,6 @@ def predict_red_sprite_probability(
 
 
 def moon_illumination(dt: datetime) -> float:
-    """
-    簡易な月の照度（照らされている割合）を0-1で返す。天文精度は高くない簡易計算。
-    """
     year = dt.year
     month = dt.month
     day = dt.day + (dt.hour / 24.0)
@@ -147,367 +141,234 @@ def moon_illumination(dt: datetime) -> float:
     return clamp(illumination, 0.0, 1.0)
 
 
-class SpriteApp(tk.Tk):
-    def __init__(self) -> None:
-        super().__init__()
-        self.title("レッドスプライト観測予測")
-        self.geometry("1120x720")
-        self.resizable(False, False)
-        self._default_latlon = (35.0, 138.0)
-        self.marker = None
-        self._build_ui()
+def fetch_weather(lat: float, lon: float, target_dt: datetime) -> tuple[float, float]:
+    """
+    Open-Meteoから雲量(%)と視程(km)を取得して、指定時刻に最も近い値を返す。
+    """
+    url = (
+        "https://api.open-meteo.com/v1/forecast"
+        f"?latitude={lat}&longitude={lon}"
+        "&hourly=cloudcover,visibility"
+        "&past_days=1&forecast_days=1&timezone=auto"
+    )
+    try:
+        with request.urlopen(url, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except error.URLError as exc:
+        raise RuntimeError(f"通信エラー: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("レスポンスの解析に失敗しました") from exc
 
-    def _build_ui(self) -> None:
-        main = ttk.Frame(self, padding=12)
-        main.pack(fill=tk.BOTH, expand=True)
-        main.grid_columnconfigure(0, weight=1, minsize=380)
-        main.grid_columnconfigure(1, weight=1)
-        main.grid_rowconfigure(0, weight=1)
+    hourly = data.get("hourly")
+    if not hourly or "time" not in hourly:
+        raise RuntimeError("時間別データが見つかりませんでした")
 
-        left = ttk.Frame(main, padding=(0, 0, 10, 0))
-        left.grid(row=0, column=0, sticky="nsew")
-        right = ttk.Frame(main)
-        right.grid(row=0, column=1, sticky="nsew")
+    times = hourly["time"]
+    clouds = hourly.get("cloudcover", [])
+    visibilities = hourly.get("visibility", [])
+    target_key = target_dt.strftime("%Y-%m-%dT%H:00")
 
-        form = ttk.LabelFrame(left, text="観測条件の入力", padding=10)
-        form.pack(fill=tk.X)
+    def nearest_index() -> int:
+        for idx, t in enumerate(times):
+            if t.startswith(target_key):
+                return idx
+        target_no_tz = datetime.strptime(target_key, "%Y-%m-%dT%H:00")
+        deltas = [abs(datetime.fromisoformat(t) - target_no_tz) for t in times]
+        return deltas.index(min(deltas))
 
-        row1 = ttk.Frame(form)
-        row1.pack(fill=tk.X, pady=4)
-        ttk.Label(row1, text="緯度 (-90〜90)").pack(side=tk.LEFT, padx=(0, 6))
-        self.lat_entry = ttk.Entry(row1, width=10)
-        self.lat_entry.insert(0, f"{self._default_latlon[0]:.2f}")
-        self.lat_entry.pack(side=tk.LEFT, padx=(0, 12))
+    idx = nearest_index()
+    try:
+        cloud_val = float(clouds[idx])
+        vis_val_km = float(visibilities[idx]) / 1000.0
+    except (IndexError, ValueError) as exc:
+        raise RuntimeError("データ抽出に失敗しました") from exc
+    return clamp(cloud_val, 0, 100), clamp(vis_val_km, 0, 40)
 
-        ttk.Label(row1, text="経度 (-180〜180)").pack(side=tk.LEFT, padx=(0, 6))
-        self.lon_entry = ttk.Entry(row1, width=10)
-        self.lon_entry.insert(0, f"{self._default_latlon[1]:.2f}")
-        self.lon_entry.pack(side=tk.LEFT, padx=(0, 12))
 
-        ttk.Label(row1, text="月 (1-12)").pack(side=tk.LEFT, padx=(0, 6))
-        self.month_spin = tk.Spinbox(row1, from_=1, to=12, width=5)
-        self.month_spin.delete(0, tk.END)
-        self.month_spin.insert(0, datetime.now().month)
-        self.month_spin.pack(side=tk.LEFT, padx=(0, 12))
+def init_state() -> None:
+    defaults = {
+        "lat": 35.0,
+        "lon": 138.0,
+        "month": datetime.now().month,
+        "hour": datetime.now().hour,
+        "storm": 6.0,
+        "cloud": 30.0,
+        "moon": 40.0,
+        "vis": 20.0,
+    }
+    for k, v in defaults.items():
+        st.session_state.setdefault(k, v)
 
-        ttk.Label(row1, text="時刻 (0-23)").pack(side=tk.LEFT, padx=(0, 6))
-        self.hour_spin = tk.Spinbox(row1, from_=0, to=23, width=5)
-        self.hour_spin.delete(0, tk.END)
-        self.hour_spin.insert(0, datetime.now().hour)
-        self.hour_spin.pack(side=tk.LEFT)
 
-        row2 = ttk.Frame(form)
-        row2.pack(fill=tk.X, pady=4)
-        label_row = ttk.Frame(row2)
-        label_row.pack(anchor=tk.W, fill=tk.X)
-        ttk.Label(label_row, text="雷活動（0:静穏〜10:非常に活発）").pack(side=tk.LEFT)
-        ttk.Button(label_row, text="目安", width=6, command=self.show_storm_help).pack(side=tk.LEFT, padx=(6, 0))
-        self.storm_scale = tk.Scale(row2, from_=0, to=10, orient=tk.HORIZONTAL, resolution=0.5, length=260)
-        self.storm_scale.set(6)
-        self.storm_scale.pack(anchor=tk.W)
+def build_map(lat: float, lon: float) -> dict[str, Any] | None:
+    m = folium.Map(location=[lat, lon], zoom_start=5, control_scale=True)
+    folium.Marker([lat, lon], tooltip=f"{lat:.3f}, {lon:.3f}").add_to(m)
+    return st_folium(m, width=520, height=480, key="map")
 
-        row3 = ttk.Frame(form)
-        row3.pack(fill=tk.X, pady=4)
-        cloud_label_row = ttk.Frame(row3)
-        cloud_label_row.pack(anchor=tk.W, fill=tk.X)
-        ttk.Label(cloud_label_row, text="雲量％").pack(side=tk.LEFT)
-        ttk.Button(cloud_label_row, text="目安", width=6, command=self.show_cloud_help).pack(side=tk.LEFT, padx=(6, 0))
-        self.cloud_scale = tk.Scale(row3, from_=0, to=100, orient=tk.HORIZONTAL, resolution=5, length=260)
-        self.cloud_scale.set(30)
-        self.cloud_scale.pack(anchor=tk.W)
 
-        row4 = ttk.Frame(form)
-        row4.pack(fill=tk.X, pady=4)
-        moon_label_row = ttk.Frame(row4)
-        moon_label_row.pack(anchor=tk.W, fill=tk.X)
-        ttk.Label(moon_label_row, text="月明かりの明るさ％").pack(side=tk.LEFT)
-        ttk.Button(moon_label_row, text="目安", width=6, command=self.show_moon_help).pack(side=tk.LEFT, padx=(6, 0))
-        self.moon_scale = tk.Scale(row4, from_=0, to=100, orient=tk.HORIZONTAL, resolution=5, length=260)
-        self.moon_scale.set(40)
-        self.moon_scale.pack(anchor=tk.W)
-
-        row5 = ttk.Frame(form)
-        row5.pack(fill=tk.X, pady=4)
-        visibility_label_row = ttk.Frame(row5)
-        visibility_label_row.pack(anchor=tk.W, fill=tk.X)
-        ttk.Label(visibility_label_row, text="視程 (km) 0-40").pack(side=tk.LEFT)
-        ttk.Button(visibility_label_row, text="目安", width=6, command=self.show_visibility_help).pack(side=tk.LEFT, padx=(6, 0))
-        self.visibility_scale = tk.Scale(row5, from_=0, to=40, orient=tk.HORIZONTAL, resolution=1, length=260)
-        self.visibility_scale.set(20)
-        self.visibility_scale.pack(anchor=tk.W)
-
-        button_row = ttk.Frame(form)
-        button_row.pack(fill=tk.X, pady=8)
-        ttk.Button(button_row, text="予測する", command=self.run_prediction).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(button_row, text="入力値の地点へ地図移動", command=self.move_map_to_entries).pack(side=tk.LEFT, padx=(12, 0))
-        ttk.Button(button_row, text="APIで自動取得", command=self.auto_fetch_conditions).pack(side=tk.LEFT, padx=(12, 0))
-
-        result_box = ttk.LabelFrame(left, text="予測結果", padding=10)
-        result_box.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
-
-        prob_row = ttk.Frame(result_box)
-        prob_row.pack(fill=tk.X)
-        ttk.Label(prob_row, text="出現確率推定").pack(side=tk.LEFT, padx=(0, 8))
-        self.prob_var = tk.DoubleVar(value=0.0)
-        self.prog = ttk.Progressbar(prob_row, maximum=100, variable=self.prob_var, length=280)
-        self.prog.pack(side=tk.LEFT, padx=(0, 12))
-        self.prob_label = ttk.Label(prob_row, text="0 %")
-        self.prob_label.pack(side=tk.LEFT)
-
-        self.hint_label = ttk.Label(result_box, text="条件を入力して「予測する」を押してください。", wraplength=700, padding=(0, 6))
-        self.hint_label.pack(anchor=tk.W)
-
-        ttk.Label(result_box, text="理由").pack(anchor=tk.W)
-        self.reason_box = tk.Text(result_box, height=10, wrap=tk.WORD)
-        self.reason_box.insert(tk.END, "入力待ち…")
-        self.reason_box.configure(state=tk.DISABLED)
-        self.reason_box.pack(fill=tk.BOTH, expand=True, pady=(2, 0))
-        foot_row = ttk.Frame(result_box)
-        foot_row.pack(anchor=tk.W, pady=(6, 0))
-        ttk.Button(foot_row, text="計算方式を表示", command=self.show_formula).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(foot_row, text="デモ条件を読み込む", command=self.load_demo).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(foot_row, text="理想条件を見る", command=self.show_best_conditions).pack(side=tk.LEFT)
-
-        map_box = ttk.LabelFrame(right, text="地図で地点を選択", padding=8)
-        map_box.pack(fill=tk.BOTH, expand=True)
-
-        info_row = ttk.Frame(map_box)
-        info_row.pack(fill=tk.X, pady=(0, 6))
-        ttk.Label(info_row, text="地図をクリックすると緯度・経度に反映されます。").pack(side=tk.LEFT)
-
-        self.map_widget = tkmv.TkinterMapView(map_box, width=480, height=620, corner_radius=0)
-        self.map_widget.pack(fill=tk.BOTH, expand=True)
-        self.map_widget.set_tile_server("https://a.tile.openstreetmap.org/{z}/{x}/{y}.png")
-        self.map_widget.set_zoom(5)
-        self.map_widget.set_position(*self._default_latlon)
-        self.map_widget.add_left_click_map_command(self.on_map_click)
-        self.update_marker(*self._default_latlon, move=False)
-
-    def load_demo(self) -> None:
-        self.lat_entry.delete(0, tk.END)
-        self.lat_entry.insert(0, "34.7")
-        self.lon_entry.delete(0, tk.END)
-        self.lon_entry.insert(0, "136.5")
-        self.month_spin.delete(0, tk.END)
-        self.month_spin.insert(0, "7")
-        self.hour_spin.delete(0, tk.END)
-        self.hour_spin.insert(0, "22")
-        self.storm_scale.set(8.5)
-        self.cloud_scale.set(20)
-        self.moon_scale.set(20)
-        self.visibility_scale.set(30)
-        self.move_map_to_entries(center_only=True)
-        self.run_prediction()
-
-    def on_map_click(self, coords: tuple[float, float]) -> None:
-        lat, lon = coords
-        self.lat_entry.delete(0, tk.END)
-        self.lat_entry.insert(0, f"{lat:.4f}")
-        self.lon_entry.delete(0, tk.END)
-        self.lon_entry.insert(0, f"{lon:.4f}")
-        self.update_marker(lat, lon, move=False)
-
-    def move_map_to_entries(self, center_only: bool = False) -> None:
-        try:
-            lat = float(self.lat_entry.get())
-            lon = float(self.lon_entry.get())
-        except ValueError:
-            messagebox.showerror("入力エラー", "緯度・経度を正しく入力してください。")
-            return
-        self.map_widget.set_position(lat, lon)
-        if not center_only:
-            self.update_marker(lat, lon, move=False)
-
-    def update_marker(self, lat: float, lon: float, move: bool = False) -> None:
-        if move:
-            self.map_widget.set_position(lat, lon)
-        if self.marker:
-            self.marker.delete()
-        self.marker = self.map_widget.set_marker(lat, lon, text=f"{lat:.2f}, {lon:.2f}")
-
-    def run_prediction(self) -> None:
-        try:
-            lat = float(self.lat_entry.get())
-            lon = float(self.lon_entry.get())
-            month = int(self.month_spin.get())
-            hour = int(self.hour_spin.get())
-        except ValueError:
-            messagebox.showerror("入力エラー", "数値を正しく入力してください。")
-            return
-
-        try:
-            prob, reasons, hint = predict_red_sprite_probability(
-                latitude=lat,
-                longitude=lon,
-                month=month,
-                hour=hour,
-                storm_activity=float(self.storm_scale.get()),
-                cloud_cover=float(self.cloud_scale.get()),
-                moon_brightness=float(self.moon_scale.get()),
-                visibility_km=float(self.visibility_scale.get()),
+def render_inputs() -> None:
+    st.subheader("観測条件の入力")
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        st.number_input("緯度 (-90〜90)", value=st.session_state["lat"], key="lat", step=0.1)
+        st.number_input("経度 (-180〜180)", value=st.session_state["lon"], key="lon", step=0.1)
+        st.number_input("月 (1-12)", min_value=1, max_value=12, value=st.session_state["month"], key="month")
+        st.number_input("時刻 (0-23)", min_value=0, max_value=23, value=st.session_state["hour"], key="hour")
+        st.slider("雷活動（0:静穏〜10:非常に活発）", 0.0, 10.0, value=st.session_state["storm"], step=0.5, key="storm")
+        with st.expander("雷活動の目安"):
+            st.write(
+                "- 雷ナウキャスト: 色付き発雷域が連続=6〜8, 広域で強=9〜10, 点在=3〜5, 無=0\n"
+                "- 落雷回数(直近1h): 0=0, 1-3=2〜3, 4-10=5, 11-30=8, 30+ =9〜10\n"
+                "- レーダー強エコー: 35-45dBZ孤立=2〜5, 45-55dBZ群=6〜8, 55dBZ超=9〜10\n"
+                "- 雷検知器10分平均: 0=0, 1-2=3, 3-5=5, 6-10=7, 10+ =9〜10\n"
+                "- 体感: 遠雷たまに=3〜4, 10分に数回=5〜6, ほぼ鳴り続く=8〜10"
             )
-        except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("計算エラー", f"計算に失敗しました: {exc}")
-            return
+    with col2:
+        st.slider("雲量％", 0.0, 100.0, value=st.session_state["cloud"], step=5.0, key="cloud")
+        with st.expander("雲量の目安"):
+            st.write(
+                "- 衛星画像: 厚い雲=80〜100, 積雲帯/まとまり=40〜70, ほぼ雲なし=0〜20\n"
+                "- オクタ換算: 0/8=0,1/8=12,2/8=25,3/8=37,4/8=50,5/8=62,6/8=75,7/8=87,8/8=100\n"
+                "- 目視: 空の雲が7〜10割=70〜100, 4〜6割=40〜60, 1〜3割=10〜30, 快晴=0〜5\n"
+                "- 星の見え方: うっすら見える=20〜40, ほぼ見えない=60〜90"
+            )
+        st.slider("月明かりの明るさ％", 0.0, 100.0, value=st.session_state["moon"], step=5.0, key="moon")
+        with st.expander("月明かりの目安"):
+            st.write(
+                "- 月齢: 新月〜三日月=0〜20, 上弦/下弦=40〜60, 十三夜〜満月=80〜100\n"
+                "- 月高度: 低い=20〜40%, 高いほど+20〜40%\n"
+                "- 雲越し: 朧月=20〜40, 厚めの雲でボヤける=40〜70, くっきり=70〜100\n"
+                "- 体感: 見えない=0〜10, ぼんやり=30〜50, 眩しく影=70〜100"
+            )
+        st.slider("視程 (km) 0-40", 0.0, 40.0, value=st.session_state["vis"], step=1.0, key="vis")
+        with st.expander("視程の目安"):
+            st.write(
+                "- METAR VIS: 10km+ →10〜15km、9999なら15km以上\n"
+                "- 地物: 山/ランドマークの距離で 5/10/20km など\n"
+                "- 星空: 天の川くっきり=15〜25km, ぼんやり=8〜15km, 見えない=〜5km\n"
+                "- 霧/黄砂: 輪郭不明=2〜5km, 形が崩れる=1〜2km, 直近のみ=0〜1km"
+            )
 
-        percent = round(prob * 100)
-        self.prob_var.set(percent)
-        self.prob_label.configure(text=f"{percent} %")
-        self.hint_label.configure(text=hint)
 
-        detail_lines = [f"緯度: {lat:.2f}°, 経度: {lon:.2f}°", "------"]
-        detail_lines.extend(f"・{r}" for r in reasons)
-        self.reason_box.configure(state=tk.NORMAL)
-        self.reason_box.delete("1.0", tk.END)
-        self.reason_box.insert(tk.END, "\n".join(detail_lines))
-        self.reason_box.configure(state=tk.DISABLED)
-        self.update_marker(lat, lon, move=False)
+def render_map() -> None:
+    st.subheader("地図で地点を選択（クリックで緯度経度に反映）")
+    map_data = build_map(st.session_state["lat"], st.session_state["lon"])
+    if map_data and map_data.get("last_clicked"):
+        lc = map_data["last_clicked"]
+        st.session_state["lat"] = lc["lat"]
+        st.session_state["lon"] = lc["lng"]
+        st.info(f"地図から設定: 緯度 {lc['lat']:.4f}, 経度 {lc['lng']:.4f}")
 
-    def auto_fetch_conditions(self) -> None:
-        try:
-            lat = float(self.lat_entry.get())
-            lon = float(self.lon_entry.get())
-            hour = int(self.hour_spin.get())
-        except ValueError:
-            messagebox.showerror("入力エラー", "緯度・経度・時刻を正しく入力してください。")
-            return
 
-        target_dt = datetime.now().replace(minute=0, second=0, microsecond=0)
-        target_dt = target_dt.replace(hour=hour)
+def render_actions() -> None:
+    col1, col2, col3 = st.columns([1, 1, 1])
+    with col1:
+        if st.button("予測する", type="primary"):
+            run_prediction_and_show()
+    with col2:
+        if st.button("APIで自動取得（雲量・視程・月明かり）"):
+            auto_fetch()
+    with col3:
+        if st.button("理想条件を見る"):
+            show_best_conditions()
 
-        try:
-            cloud, visibility = self.fetch_weather(lat, lon, target_dt)
-        except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("取得失敗", f"天気APIの取得に失敗しました: {exc}")
-            return
 
-        moon_pct = round(moon_illumination(target_dt) * 100)
-        moon_pct = clamp(moon_pct, 0, 100)
-
-        self.cloud_scale.set(round(cloud))
-        self.visibility_scale.set(round(visibility))
-        self.moon_scale.set(round(moon_pct))
-        messagebox.showinfo(
-            "自動取得完了",
-            "Open-Meteoから雲量・視程を取得し、月明かりは現在日付+指定時刻で計算しました。\n"
-            f"雲量: {cloud:.1f}%, 視程: {visibility:.1f} km, 月明かり推定: {moon_pct:.0f}%",
+def run_prediction_and_show() -> None:
+    try:
+        prob, reasons, hint = predict_red_sprite_probability(
+            latitude=float(st.session_state["lat"]),
+            longitude=float(st.session_state["lon"]),
+            month=int(st.session_state["month"]),
+            hour=int(st.session_state["hour"]),
+            storm_activity=float(st.session_state["storm"]),
+            cloud_cover=float(st.session_state["cloud"]),
+            moon_brightness=float(st.session_state["moon"]),
+            visibility_km=float(st.session_state["vis"]),
         )
-        # 自動取得後に最新値で再計算
-        self.run_prediction()
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"計算に失敗しました: {exc}")
+        return
 
-    def fetch_weather(self, lat: float, lon: float, target_dt: datetime) -> tuple[float, float]:
-        """
-        Open-Meteoから雲量(%)と視程(km)を取得し、指定時刻に最も近い値を返す。
-        """
-        base_url = (
-            "https://api.open-meteo.com/v1/forecast"
-            f"?latitude={lat}&longitude={lon}"
-            "&hourly=cloudcover,visibility"
-            "&past_days=1&forecast_days=1&timezone=auto"
+    percent = round(prob * 100)
+    st.subheader("予測結果")
+    st.progress(prob, text=f"{percent}%")
+    st.metric("出現確率 (推定)", f"{percent} %")
+    st.write(f"**観測ヒント:** {hint}")
+    st.write("**理由**")
+    for r in reasons:
+        st.write(f"- {r}")
+
+
+def auto_fetch() -> None:
+    try:
+        lat = float(st.session_state["lat"])
+        lon = float(st.session_state["lon"])
+        hour = int(st.session_state["hour"])
+    except ValueError:
+        st.error("緯度・経度・時刻を正しく入力してください。")
+        return
+
+    target_dt = datetime.now().replace(minute=0, second=0, microsecond=0, hour=hour)
+    try:
+        cloud, visibility = fetch_weather(lat, lon, target_dt)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"天気APIの取得に失敗しました: {exc}")
+        return
+
+    moon_pct = round(moon_illumination(target_dt) * 100)
+    st.session_state["cloud"] = round(cloud)
+    st.session_state["vis"] = round(visibility)
+    st.session_state["moon"] = moon_pct
+    st.success(
+        f"自動取得完了: 雲量 {cloud:.1f}%, 視程 {visibility:.1f} km, 月明かり推定 {moon_pct}%"
+    )
+    run_prediction_and_show()
+
+
+def show_best_conditions() -> None:
+    st.info(
+        "理想に近い観測条件の目安:\n"
+        "- 場所: 緯度10〜45度帯。都市光害が少ない開けた場所。雷雲から水平距離50〜150km離れて側方〜背後を狙う。\n"
+        "- 季節/時間: 暖候期(5〜9月)。時刻は21〜02時が最有利、18〜20時/3〜5時が次点。\n"
+        "- 気象: 雷活動が非常に活発(落雷多いセル/強エコー)。雲量20%以下。視程20km以上。降水域の真下は避ける。\n"
+        "- 光条件: 新月〜三日月や月が低い/陰るタイミング。街灯や車灯が少ない暗所で暗順応。\n"
+        "- 観測姿勢: 雷雲の真上ではなく少し離れた上空を注視。広角・長秒露光+三脚、連写/インターバル撮影で記録。"
+    )
+
+
+def show_formula() -> None:
+    with st.expander("計算方式を見る", expanded=False):
+        st.markdown(
+            "\n".join(
+                [
+                    "- 台形スコアで0〜1に正規化後、重み付き和で z を計算しロジスティック変換",
+                    "  緯度: low=-10, 最適=10〜45, high=60 → 重み0.6",
+                    "  季節: low=2.5, 最適=5〜9, high=11.5 → 重み0.5",
+                    "  時刻: 21-02時=1.0, 18-20/3-5時=0.6, それ以外=0.1 → 重み0.4",
+                    "  雷活動: (0〜10)/10 → 重み2.0",
+                    "  雲量: (1 - 雲量%/100) → 重み0.4",
+                    "  月明かり: (1 - 明るさ%/100) → 重み0.2",
+                    "  視程: (km/40) → 重み0.6",
+                    "- z = -3.0 + Σ(重み×スコア), 確率 = 1/(1+exp(-z)) を0〜100%表示",
+                    "- 70%以上: 良好, 40%以上: 並, それ未満: 弱め のヒント",
+                ]
+            )
         )
-        try:
-            with request.urlopen(base_url, timeout=10) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-        except error.URLError as exc:
-            raise RuntimeError(f"通信エラー: {exc}") from exc
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("レスポンスの解析に失敗しました") from exc
 
-        hourly = data.get("hourly")
-        if not hourly or "time" not in hourly:
-            raise RuntimeError("時間別データが見つかりませんでした")
 
-        times = hourly["time"]
-        clouds = hourly.get("cloudcover", [])
-        visibilities = hourly.get("visibility", [])
-        target_key = target_dt.strftime("%Y-%m-%dT%H:00")
+def main() -> None:
+    init_state()
+    st.title("レッドスプライト観測予測 (Web版)")
 
-        def nearest_index() -> int:
-            for idx, t in enumerate(times):
-                if t.startswith(target_key):
-                    return idx
-            target_no_tz = datetime.strptime(target_key, "%Y-%m-%dT%H:00")
-            deltas = [abs(datetime.fromisoformat(t) - target_no_tz) for t in times]
-            return deltas.index(min(deltas))
+    col_map, col_form = st.columns([1, 1])
+    with col_map:
+        render_map()
+    with col_form:
+        render_inputs()
 
-        idx = nearest_index()
-        try:
-            cloud_val = float(clouds[idx])
-            vis_val_km = float(visibilities[idx]) / 1000.0
-        except (IndexError, ValueError) as exc:
-            raise RuntimeError("データ抽出に失敗しました") from exc
-        return clamp(cloud_val, 0, 100), clamp(vis_val_km, 0, 40)
-
-    def show_formula(self) -> None:
-        lines = [
-            "現在の計算方法（ロジスティック結合ヒューリスティック）:",
-            "- 台形スコアで0〜1に正規化してから重み付けし z を計算",
-            "  緯度: low=-10, 最適=10〜45, high=60 → 重み0.6",
-            "  季節: low=2.5, 最適=5〜9, high=11.5 → 重み0.5",
-            "  時刻: 21-02時=1.0, 18-20/3-5時=0.6, それ以外=0.1 → 重み0.4",
-            "  雷活動: (0〜10)/10 → 重み2.0",
-            "  雲量: (1 - 雲量%/100) → 重み0.4",
-            "  月明かり: (1 - 明るさ%/100) → 重み0.2",
-            "  視程: (km/40) → 重み0.6",
-            "- z = -3.0 + Σ(重み×スコア)、確率 = 1/(1+exp(-z)) を0〜100%表示",
-            "- 70%以上: 良好, 40%以上: 並, それ未満: 弱め のヒント",
-        ]
-        messagebox.showinfo("計算方式", "\n".join(lines))
-
-    def show_storm_help(self) -> None:
-        lines = [
-            "雷活動(0〜10)の入れ方の目安:",
-            "- 気象庁 雷ナウキャスト: 色付き発雷域が連続=6〜8, 広域で強=9〜10, 点在=3〜5, 無=0",
-            "- 落雷回数(直近1h): 0回=0, 1-3回=2〜3, 4-10回=5, 11-30回=8, 30回超=9〜10",
-            "- レーダー強エコー: 35-45dBZ孤立セル=2〜5, 45-55dBZのセル群=6〜8, 55dBZ超の多セル/線状=9〜10",
-            "- 手元の雷センサー(10分平均): 0回=0, 1-2回=3, 3-5回=5, 6-10回=7, 10回超=9〜10",
-            "- 体感: 遠雷がたまに=3〜4, 10分に数回鳴る=5〜6, ほぼ鳴り続く=8〜10",
-        ]
-        messagebox.showinfo("雷活動の目安", "\n".join(lines))
-
-    def show_cloud_help(self) -> None:
-        lines = [
-            "雲量(0〜100%)の入れ方の目安:",
-            "- 気象衛星画像（赤外/可視）: 広域に厚い雲=80〜100, 積雲が帯状/まとまる=40〜70, ほぼ雲なし=0〜20",
-            "- 雲量オクタ(METAR/TAF): 0/8=0, 1/8=12, 2/8=25, 3/8=37, 4/8=50, 5/8=62, 6/8=75, 7/8=87, 8/8=100 に換算",
-            "- 直感: 空の7〜10割が雲=70〜100, 4〜6割=40〜60, 1〜3割=10〜30, ほぼ快晴=0〜5",
-            "- レーダーや衛星の薄雲判別が難しい時は、星がうっすら見える=20〜40, 星がほぼ見えない=60〜90で入力",
-        ]
-        messagebox.showinfo("雲量の目安", "\n".join(lines))
-
-    def show_moon_help(self) -> None:
-        lines = [
-            "月明かりの明るさ(0〜100%)の入れ方の目安:",
-            "- 月齢: 新月〜三日月=0〜20, 上弦/下弦=40〜60, 十三夜〜満月=80〜100",
-            "- 月高度: 地平線近くは20〜40%に抑え、高く昇るほど＋20〜40%を上乗せ",
-            "- 雲越し: 薄雲で朧月=20〜40, 厚めの雲でボヤける=40〜70, くっきり見える=70〜100",
-            "- 簡易推定: 月が見えない=0〜10, 輪郭がぼんやり=30〜50, 眩しい/影ができる=70〜100",
-        ]
-        messagebox.showinfo("月明かりの目安", "\n".join(lines))
-
-    def show_visibility_help(self) -> None:
-        lines = [
-            "視程(0〜40km)の入れ方の目安:",
-            "- 気象台/空港METAR: VIS 10km以上→10〜15km、9999表記なら15km以上とみなす",
-            "- 地物で推定: 近くの山やランドマークの距離を既知とし、見え方に応じて 5km, 10km, 20km などを入力",
-            "- 星空の見え方: 夏の天の川がはっきり=15〜25km, ぼんやり=8〜15km, ほぼ見えない=5km以下",
-            "- 霧/黄砂/煙霧: 霞んで輪郭が不明瞭=2〜5km, 建物の形が崩れる=1〜2km, すぐ近くしか見えない=0〜1km",
-            "- 不明なときの簡易: 遠くの高層ビルが見える=10〜15km, 山稜が見える=15〜25km, ほぼ見えない=0〜5km",
-        ]
-        messagebox.showinfo("視程の目安", "\n".join(lines))
-
-    def show_best_conditions(self) -> None:
-        lines = [
-            "理想に近い観測条件の目安:",
-            "- 場所: 緯度10〜45度帯。都市光害が少ない開けた場所。雷雲から水平距離50〜150km離れて側方〜背後を狙う。",
-            "- 季節/時間: 暖候期(5〜9月)。時刻は21〜02時が最有利、18〜20時/3〜5時が次点。",
-            "- 気象: 雷活動が非常に活発(落雷多いセル/強エコー)。雲量20%以下。視程20km以上。降水域の真下は避ける。",
-            "- 光条件: 新月〜三日月や月が低い/陰るタイミング。街灯や車灯が少ない暗所で暗順応。",
-            "- 観測姿勢: 雷雲の真上ではなく少し離れた上空を注視。広角・長秒露光+三脚、連写/インターバル撮影で記録。",
-        ]
-        messagebox.showinfo("理想条件", "\n".join(lines))
+    render_actions()
+    show_formula()
 
 
 if __name__ == "__main__":
-    app = SpriteApp()
-    app.mainloop()
+    main()
